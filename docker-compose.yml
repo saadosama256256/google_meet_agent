@@ -1,0 +1,26 @@
+services:
+  meet-recording-bot:
+    build: .
+    container_name: meet-recording-bot
+    restart: unless-stopped
+    environment:
+      - TZ=Africa/Cairo
+      - MODE=run                # غيّرها لـ login مؤقتًا وقت عمل تسجيل الدخول لأول مرة
+      - VNC_PASSWORD=changeme   # غيّرها قبل أي استخدام فعلي!
+    ports:
+      - "7860:7860"                 # health-check endpoint (FastAPI)
+      - "127.0.0.1:5900:5900"      # VNC — متاح بس محليًا على السيرفر (اتصل عن طريق SSH tunnel)
+    volumes:
+      - chrome-profile:/app/chrome-profile
+    deploy:
+      resources:
+        limits:
+          # ملحوظة: وضع login (Xvfb+VNC+Chrome headed) بياخد رام أكتر من التشغيل العادي
+          # لو هتستخدم login مؤقتًا زود الحد ده مؤقتًا لـ 1800M لو لقيت مشاكل
+          memory: 1200M
+        reservations:
+          memory: 400M
+    shm_size: '256mb'
+
+volumes:
+  chrome-profile:
