@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Africa/Cairo
-      - MODE=run                # غيّرها لـ login مؤقتًا وقت عمل تسجيل الدخول لأول مرة
+      -  MODE=login                # غيّرها لـ login مؤقتًا وقت عمل تسجيل الدخول لأول مرة
       - VNC_PASSWORD=changeme   # غيّرها قبل أي استخدام فعلي!
     ports:
       - "7860:7860"                 # health-check endpoint (FastAPI)
