@@ -1,12 +1,20 @@
 import telebot
 import threading
 import queue
+import time
+import logging
 from config import TELEGRAM_TOKEN, ALLOWED_USER_ID
 import browser
 
-# استيراد مكتبات الويب الخاصة بتثبيت بيئة Hugging Face Spaces
+# استيراد مكتبات الويب الخاصة بتثبيت بيئة Hugging Face Spaces / Coolify
 from fastapi import FastAPI
 import uvicorn
+
+# إعداد نظام تسجيل الأخطاء والأحداث (Logging)
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -14,7 +22,10 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 cmd_queue = queue.Queue()
 
 def is_allowed(message):
-    return message.from_user.id == ALLOWED_USER_ID
+    if message.from_user.id != ALLOWED_USER_ID:
+        logging.warning(f"محاولة وصول غير مصرح بها من ID: {message.from_user.id}")
+        return False
+    return True
 
 # ===== إرسال أمر وانتظار النتيجة =====
 def run_browser_command(func, *args):
@@ -52,6 +63,8 @@ def cmd_stop(message):
     bot.reply_to(message, "🛑 جاري إيقاف التسجيل...")
     result = run_browser_command(browser.stop_recording)
     bot.reply_to(message, result)
+    
+    bot.reply_to(message, "🏃 جاري مغادرة الاجتماع...")
     result2 = run_browser_command(browser.leave_meeting)
     bot.reply_to(message, result2)
 
@@ -74,16 +87,34 @@ def cmd_join(message):
 
 # ===== الـ Loop الرئيسي لـ Playwright =====
 def browser_loop():
-    browser.connect_browser()
-    while True:
-        func, args, result = cmd_queue.get()
-        try:
-            func(*args)
-            result.put("✅ تم بنجاح!")
-        except Exception as e:
-            result.put(f"⚠️ خطأ: {e}")
+    try:
+        logging.info("🌐 جاري تشغيل المتصفح...")
+        browser.connect_browser()
+    except Exception as e:
+        logging.error(f"❌ فشل في بدء المتصفح: {e}")
 
-# ===== إعداد خادم الويب الوهمي لإرضاء منصة Hugging Face =====
+    while True:
+        func, args, result_queue = cmd_queue.get()
+        try:
+            # تنفيذ الدالة والحصول على نتيجتها إن وجدت
+            res = func(*args)
+            # إذا أرجعت الدالة رسالة نصية نرسلها، وإلا نرسل رسالة النجاح الافتراضية
+            result_queue.put(res if res else "✅ تم الإجراء بنجاح!")
+        except Exception as e:
+            logging.error(f"⚠️ خطأ أثناء تنفيذ أمر المتصفح: {e}")
+            result_queue.put(f"⚠️ حدث خطأ: {e}")
+
+# ===== دالة التشغيل الآمنة للبوت =====
+def run_telebot():
+    while True:
+        try:
+            logging.info("🤖 جاري بدء استماع تليجرام (infinity_polling)...")
+            bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            logging.error(f"⚠️ انقطع اتصال تليجرام مع الخطأ: {e}")
+            time.sleep(5)  # الانتظار قليلاً قبل محاولة إعادة الاتصال لتجنب الحظر
+
+# ===== إعداد خادم الويب الوهمي لإرضاء المنصة =====
 app = FastAPI()
 
 @app.get("/")
@@ -96,11 +127,10 @@ if __name__ == "__main__":
     t_browser = threading.Thread(target=browser_loop, daemon=True)
     t_browser.start()
 
-    # 2. تشغيل خيط البوت (Telegram Polling) في الخلفية
-    print("🤖 جاري تشغيل بوت تليجرام...")
-    t_bot = threading.Thread(target=lambda: bot.polling(none_stop=True), daemon=True)
+    # 2. تشغيل خيط البوت (Telegram Polling) الآمن في الخلفية
+    t_bot = threading.Thread(target=run_telebot, daemon=True)
     t_bot.start()
 
     # 3. تشغيل خادم الويب في الـ Main Thread (الخيط الأساسي) لمنع إغلاق الحاوية
-    print("🌐 جاري تشغيل خادم الويب على المنفذ الإجباري 7860...")
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    logging.info("⚡ جاري تشغيل خادم الويب على المنفذ الإجباري 7860...")
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="warning")
