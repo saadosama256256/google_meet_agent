@@ -5,11 +5,12 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Africa/Cairo
-      -  MODE=run                # غيّرها لـ login مؤقتًا وقت عمل تسجيل الدخول لأول مرة
+      - MODE=run                # غيّرها لـ login مؤقتًا وقت عمل تسجيل الدخول لأول مرة
       - VNC_PASSWORD=changeme   # غيّرها قبل أي استخدام فعلي!
     ports:
-      - "7860:7860"                 # health-check endpoint (FastAPI)
-      - "127.0.0.1:5900:5900"      # VNC — متاح بس محليًا على السيرفر (اتصل عن طريق SSH tunnel)
+      - "7860:7860"             # health-check endpoint (FastAPI)
+      - "6080:6080"             # واجهة noVNC للبث المباشر عبر المتصفح
+      - "127.0.0.1:5900:5900"   # VNC — متاح بس محليًا على السيرفر (اتصل عن طريق SSH tunnel)
     volumes:
       - chrome-profile:/app/chrome-profile
     deploy:
