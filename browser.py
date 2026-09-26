@@ -62,6 +62,27 @@ def wait_and_click(page, selector, timeout_ms=15000, label=""):
     print(f"   ❌ {label} لم يظهر خلال {timeout_ms}ms")
     return False
 
+def wake_up_controls(page):
+    """تحريك الماوس لإظهار شريط الأدوات السفلي في حال اختفائه تلقائياً"""
+    page.mouse.move(500, 500)
+    page.wait_for_timeout(200)
+    page.mouse.move(960, 540)
+    page.wait_for_timeout(300)
+
+def open_more_options(page):
+    """فتح قائمة النقاط الثلاث بأمان مع التأكد من ظهور الشريط"""
+    wake_up_controls(page)
+    
+    # التحقق أولاً إذا كانت القائمة مفتوحة بالفعل
+    is_menu_open = page.locator("ul[role='menu'], div[role='menu']").is_visible()
+    if is_menu_open:
+        return
+
+    btn = page.locator("button[aria-label*='options' i], button[aria-label*='المزيد' i], button[data-panel-id='quick-actions']").first
+    btn.wait_for(state="attached", timeout=10000)
+    btn.click(force=True)
+    page.wait_for_timeout(1000)
+
 def join_meeting(num, link):
     num_str = str(num)
     context = state["context"]
@@ -78,7 +99,7 @@ def join_meeting(num, link):
     page.goto(link, wait_until="domcontentloaded", timeout=60000)
 
     if "accounts.google.com" in page.url:
-        raise Exception("⚠️ الجلسة منتهية، يتطلب تسجيل الدخول")
+        raise Exception("⚠️ انتهت صلاحية الجلسة، يتطلب تسجيل الدخول")
 
     join_button = page.locator(
         "button:has-text('Join now'), "
@@ -89,6 +110,12 @@ def join_meeting(num, link):
     join_button.click()
     print(f"✅ [محاضرة {num_str}] تم الدخول للاجتماع")
 
+    try:
+        context.storage_state(path="auth.json")
+        print("💾 تم تحديث auth.json")
+    except Exception as e:
+        print(f"⚠️ فشل تحديث auth.json: {e}")
+
 def start_recording(num):
     page = get_page(num)
     if not page:
@@ -96,22 +123,19 @@ def start_recording(num):
 
     print(f"🔴 [محاضرة {num}] جاري بدء التسجيل...")
 
-    # 1. فتح القائمة السفلية (More options)
-    more_btn = page.locator("button[aria-label*='options' i], button[aria-label*='المزيد' i]").first
-    more_btn.wait_for(timeout=15000)
-    more_btn.click(force=True)
-    page.wait_for_timeout(1000)
+    # 1. فتح القائمة السفلية
+    open_more_options(page)
 
-    # 2. النقر على Recording (سواء كان اسمها Recording أو Manage recording أو تسجيل)
+    # 2. النقر على عنصر التسجيل عبر موقعه الفعلي بالشاشة لتجاوز الطبقات
     clicked_rec = page.evaluate('''() => {
-        const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
-        const item = items.find(el => 
-            el.innerText.includes("Recording") || 
-            el.innerText.includes("تسجيل") ||
-            el.innerText.includes("Manage recording")
-        );
-        if (item) {
-            const r = item.getBoundingClientRect();
+        const allElements = Array.from(document.querySelectorAll('li, div, span, button'));
+        const target = allElements.reverse().find(el => {
+            const txt = (el.innerText || "").trim();
+            return (txt === "Recording" || txt === "تسجيل" || txt.startsWith("Recording") || txt.startsWith("تسجيل")) && el.offsetParent !== null;
+        });
+
+        if (target) {
+            const r = target.getBoundingClientRect();
             return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
         }
         return null;
@@ -119,22 +143,32 @@ def start_recording(num):
 
     if clicked_rec:
         real_click(page, clicked_rec['x'], clicked_rec['y'])
-        print("   زر Recording في القائمة ✅")
+        print("   تم الضغط على خيار Recording ✅")
     else:
-        raise Exception("❌ لم يتم العثور على خيار التسجيل في القائمة")
+        rec_locator = page.locator("text='Recording', text='تسجيل'").first
+        rec_locator.wait_for(timeout=5000)
+        rec_locator.click(force=True)
 
     page.wait_for_timeout(1500)
 
-    # 3. الضغط على زر Start recording الفعلي في اللوحة الجانبية
-    success = wait_and_click(page, '[jsname="A0ONe"]', 15000, "زر Start recording")
-    if not success:
-        wait_and_click(page, 'button:has-text("Start recording"), button:has-text("بدء التسجيل")', 8000, "زر البدء (fallback)")
+    # 3. الضغط على زر Start recording في اللوحة الجانبية
+    start_btn_clicked = wait_and_click(page, '[jsname="A0ONe"]', 8000, "زر Start recording الأساسي")
+    if not start_btn_clicked:
+        start_btn = page.locator("button:has-text('Start recording'), button:has-text('بدء التسجيل')").first
+        if start_btn.is_visible():
+            start_btn.click(force=True)
 
-    # 4. زر التأكيد في النافذة المنبثقة
-    wait_and_click(page, '[data-mdc-dialog-action="A9Emjd"]', 10000, "زر التأكيد")
+    page.wait_for_timeout(1000)
+
+    # 4. تأكيد التسجيل من النافذة المنبثقة
+    confirm_clicked = wait_and_click(page, '[data-mdc-dialog-action="A9Emjd"]', 6000, "زر التأكيد")
+    if not confirm_clicked:
+        confirm_btn = page.locator("button:has-text('Start'), button:has-text('بدء')").first
+        if confirm_btn.is_visible():
+            confirm_btn.click(force=True)
 
     print(f"✅ [محاضرة {num}] بدأ التسجيل بنجاح!")
-    return "✅ بدأ التسجيل بنجاح!"
+    return "✅ بدأ التسجيل بنجاح في Google Meet!"
 
 def stop_recording(num):
     page = get_page(num)
@@ -143,20 +177,17 @@ def stop_recording(num):
 
     print(f"🛑 [محاضرة {num}] جاري إيقاف التسجيل...")
 
-    more_btn = page.locator("button[aria-label*='options' i], button[aria-label*='المزيد' i]").first
-    more_btn.wait_for(timeout=15000)
-    more_btn.click(force=True)
-    page.wait_for_timeout(1000)
+    open_more_options(page)
 
     clicked_rec = page.evaluate('''() => {
-        const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
-        const item = items.find(el => 
-            el.innerText.includes("Recording") || 
-            el.innerText.includes("تسجيل") ||
-            el.innerText.includes("Manage recording")
-        );
-        if (item) {
-            const r = item.getBoundingClientRect();
+        const allElements = Array.from(document.querySelectorAll('li, div, span, button'));
+        const target = allElements.reverse().find(el => {
+            const txt = (el.innerText || "").trim();
+            return (txt === "Recording" || txt === "تسجيل" || txt.startsWith("Recording") || txt.startsWith("تسجيل")) && el.offsetParent !== null;
+        });
+
+        if (target) {
+            const r = target.getBoundingClientRect();
             return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
         }
         return null;
@@ -167,13 +198,16 @@ def stop_recording(num):
 
     page.wait_for_timeout(1500)
 
-    # زر Stop recording
-    success = wait_and_click(page, '[jsname="ahMSA"]', 15000, "زر Stop recording")
-    if not success:
-        wait_and_click(page, 'button:has-text("Stop recording"), button:has-text("إيقاف التسجيل")', 8000, "زر الإيقاف (fallback)")
+    # الضغط على زر Stop recording
+    stop_clicked = wait_and_click(page, '[jsname="ahMSA"]', 8000, "زر Stop recording")
+    if not stop_clicked:
+        stop_btn = page.locator("button:has-text('Stop recording'), button:has-text('إيقاف التسجيل')").first
+        if stop_btn.is_visible():
+            stop_btn.click(force=True)
 
-    # زر التأكيد
-    wait_and_click(page, '[data-mdc-dialog-action="A9Emjd"]', 10000, "زر التأكيد")
+    page.wait_for_timeout(1000)
+    wait_and_click(page, '[data-mdc-dialog-action="A9Emjd"]', 6000, "زر تأكيد الإيقاف")
+
     print(f"✅ [محاضرة {num}] تم إيقاف التسجيل")
     return "🛑 تم إيقاف التسجيل بنجاح!"
 
@@ -193,3 +227,20 @@ def leave_meeting(num):
     state["pages"].pop(str(num), None)
     print(f"✅ [محاضرة {num}] تمت المغادرة")
     return "🚪 تمت مغادرة الاجتماع بنجاح!"
+
+def refresh_and_rejoin(num):
+    page = get_page(num)
+    if not page:
+        raise Exception(f"المحاضرة {num} غير مفتوحة")
+
+    print(f"🔄 [محاضرة {num}] جاري التحديث وإعادة الدخول...")
+    page.reload(wait_until="domcontentloaded", timeout=60000)
+
+    join_button = page.locator(
+        "button:has-text('Join now'), "
+        "button:has-text('Join now without microphone'), "
+        "button:has-text('الانضمام الآن')"
+    ).first
+    join_button.wait_for(timeout=60000)
+    join_button.click()
+    print(f"✅ [محاضرة {num}] تم إعادة الدخول بنجاح")
