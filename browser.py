@@ -1,5 +1,6 @@
-from playwright.sync_api import sync_playwright
+import re
 import time
+from playwright.sync_api import sync_playwright
 
 state = {
     "playwright": None,
@@ -7,6 +8,30 @@ state = {
     "context": None,
     "pages": {},
 }
+
+# المحاضرات الافتراضية الثلاث الثابتة (عدّلها بروابطك الأساسية)
+DEFAULT_MEETINGS = {
+    "1": "https://meet.google.com/xxx-yyyy-zzz",
+    "2": "https://meet.google.com/aaa-bbbb-ccc",
+    "3": "https://meet.google.com/mmm-nnnn-ooo",
+}
+
+def extract_meet_info(target: str) -> tuple[str, str]:
+    """استخراج كود ورابط الاجتماع سواء أكان رقماً (1-3) أو رابطاً كاملاً"""
+    target = target.strip()
+    if target in DEFAULT_MEETINGS:
+        url = DEFAULT_MEETINGS[target]
+        return target, url
+
+    match = re.search(r"([a-z]{3}-[a-z]{4}-[a-z]{3})", target)
+    if match:
+        code = match.group(1)
+        return code, f"https://meet.google.com/{code}"
+
+    if target.startswith("http"):
+        return target[-10:], target
+
+    return target, f"https://meet.google.com/{target}"
 
 def connect_browser():
     state["playwright"] = sync_playwright().start()
@@ -30,29 +55,18 @@ def list_open_meetings():
     return list(state["pages"].keys())
 
 def real_click(page, x, y):
-    """ضغطة ماوس حقيقية بإحداثيات الشاشة"""
+    """ضغطة ماوس حقيقية بإحداثيات الشاشة لتخطي أي Overlay شفاف"""
     page.mouse.move(x, y)
-    page.wait_for_timeout(200)
+    page.wait_for_timeout(150)
     page.mouse.down()
     page.wait_for_timeout(100)
     page.mouse.up()
-
-def get_coords(page, selector):
-    return page.evaluate(f"""
-        () => {{
-            const btn = document.querySelector('{selector}');
-            if (!btn) return null;
-            const r = btn.getBoundingClientRect();
-            return {{ x: r.x + r.width / 2, y: r.y + r.height / 2 }};
-        }}
-    """)
 
 def wait_and_click(page, selector, timeout_ms=15000, label=""):
     """انتظار ذكي ثم النقر عبر جافاسكربت لتخطي الطبقات الشفافة تماماً"""
     waited = 0
     interval = 300
     while waited < timeout_ms:
-        # البحث عن العنصر في DOM والنقر عليه مباشرة (أقوى طريقة لـ Meet)
         clicked = page.evaluate(f"""() => {{
             const btn = document.querySelector('{selector}');
             if (btn && btn.offsetParent !== null) {{
@@ -72,9 +86,9 @@ def wait_and_click(page, selector, timeout_ms=15000, label=""):
 def wake_up_controls(page):
     """تحريك الماوس لإجبار الشريط السفلي على الظهور"""
     page.mouse.move(500, 500)
-    page.wait_for_timeout(200)
+    page.wait_for_timeout(150)
     page.mouse.move(960, 540)
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(200)
 
 def open_more_options(page):
     """فتح القائمة السفلية مع تجنب أزرار المشتركين تماماً"""
@@ -83,33 +97,48 @@ def open_more_options(page):
     if page.locator("ul[role='menu'], div[role='menu']").is_visible():
         return
 
-    # استخدام التطابق التام (Exact Match) لضمان عدم التقاط زر فيديو المشترك
     btn = page.locator('button[aria-label="More options"], button[aria-label="المزيد من الخيارات"]').first
-    
     try:
         btn.wait_for(state="attached", timeout=8000)
-        # النقر المباشر (DOM Click) لتجاوز خطأ التمرير (scrolling into view)
         btn.evaluate("el => el.click()")
-    except:
-        # خطة بديلة باستخدام دور العنصر
+    except Exception:
         fallback = page.get_by_role("button", name="More options", exact=True)
         fallback.evaluate("el => el.click()")
         
     page.wait_for_timeout(1000)
 
-def join_meeting(num, link):
-    num_str = str(num)
+def apply_resource_limits(page):
+    """ترشيد استهلاك المعالج والرام بحظر تنزيل الصور والميديا"""
+    def route_filter(route):
+        # السماح بطلبات الويب الأساسية والـ API والصوت فقط، وحظر تدفق الفيديو والصور الثقيلة
+        if route.request.resource_type in ["image", "media", "font"]:
+            route.abort()
+        else:
+            route.continue_()
+            
+    page.route("**/*", route_filter)
+
+def join_meeting(target, custom_link=None):
+    session_id, link = extract_meet_info(target)
+    if custom_link:
+        _, link = extract_meet_info(custom_link)
+        session_id = str(target)
+
     context = state["context"]
-    if num_str in state["pages"]:
+    if session_id in state["pages"]:
         try:
-            state["pages"][num_str].close()
+            state["pages"][session_id].close()
         except Exception:
             pass
 
     page = context.new_page()
-    state["pages"][num_str] = page
+    
+    # 1. تفعيل ترشيد الموارد على الصفحة فور إنشائها
+    apply_resource_limits(page)
 
-    print(f"🔗 [محاضرة {num_str}] جاري الدخول: {link}")
+    state["pages"][session_id] = page
+
+    print(f"🔗 [جلسة {session_id}] جاري الدخول: {link}")
     page.goto(link, wait_until="domcontentloaded", timeout=60000)
 
     if "accounts.google.com" in page.url:
@@ -121,15 +150,15 @@ def join_meeting(num, link):
         "button:has-text('الانضمام الآن')"
     ).first
     join_button.wait_for(timeout=60000)
-    
-    # تجنب أي تعليق أثناء الضغط على زر الانضمام
     join_button.evaluate("el => el.click()")
-    print(f"✅ [محاضرة {num_str}] تم الدخول للاجتماع")
+    print(f"✅ [جلسة {session_id}] تم الدخول للاجتماع")
 
     try:
         context.storage_state(path="auth.json")
     except Exception:
         pass
+        
+    return session_id
 
 def start_recording(num):
     page = get_page(num)
@@ -148,7 +177,7 @@ def start_recording(num):
         });
 
         if (target) {
-            target.click(); // النقر البرمجي هو الأضمن هنا
+            target.click();
             return true;
         }
         return false;
@@ -161,7 +190,7 @@ def start_recording(num):
 
     page.wait_for_timeout(1500)
 
-    # الضغط على زر Start recording الجانبي
+    # الضغط على زر Start recording
     success = wait_and_click(page, '[jsname="A0ONe"]', 10000, "زر Start recording")
     if not success:
         fallback = page.locator("button:has-text('Start recording'), button:has-text('بدء التسجيل')").first
