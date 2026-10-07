@@ -21,6 +21,9 @@ BLOCK_IMAGES = True
 # مجلد حفظ لقطات الشاشة عند الفشل (للتشخيص)
 DEBUG_DIR = "debug"
 
+# حفظ لقطة شاشة بعد كل بدء/إيقاف تسجيل (للتشخيص، عطّله لاحقاً)
+ALWAYS_DEBUG = True
+
 # ملف حفظ الجلسة (يحتوي كوكيز الحساب: لا ترفعه لأي مستودع!)
 AUTH_FILE = "auth.json"
 
@@ -367,17 +370,45 @@ def open_recording_panel(page):
     raise MeetBotError("❌ لم يتم العثور على خيار التسجيل في القائمة")
 
 
-def _wait_dialog_closed(page, timeout_ms=6000):
-    waited = 0
-    while waited < timeout_ms:
+def _btn_visible(page, name_re):
+    try:
+        b = page.get_by_role("button", name=name_re).first
+        return b.count() > 0 and b.is_visible()
+    except Exception:
+        return False
+
+
+def _recording_state(page, reopen=True, timeout_ms=6000):
+    """يرجع 'active' (زر Stop ظاهر) أو 'idle' (زر Start ظاهر) أو 'unknown'."""
+    if reopen:
         try:
-            if not page.locator(DIALOG_SEL).first.is_visible():
-                return True
-        except Exception:
-            return True
-        page.wait_for_timeout(300)
-        waited += 300
-    return False
+            open_recording_panel(page)
+        except MeetBotError:
+            return "unknown"
+    waited = 0
+    while waited <= timeout_ms:
+        if _btn_visible(page, STOP_REC_RE):
+            return "active"
+        if _btn_visible(page, START_REC_RE):
+            return "idle"
+        page.wait_for_timeout(400)
+        waited += 400
+    return "unknown"
+
+
+def _verify_started(page):
+    # اللوحة قد تبقى مفتوحة وتعرض Stop recording بعد البدء
+    waited = 0
+    while waited < 8000:
+        if _btn_visible(page, STOP_REC_RE):
+            return "active"
+        page.wait_for_timeout(500)
+        waited += 500
+    state_ = _recording_state(page, reopen=True)
+    if state_ == "idle":
+        page.wait_for_timeout(5000)  # قد يكون التسجيل ما زال يتهيأ
+        state_ = _recording_state(page, reopen=True)
+    return state_
 
 
 # ============================================================
@@ -590,12 +621,20 @@ def start_recording(num):
         8000,
         "زر التأكيد",
     )
-    if confirmed and not _wait_dialog_closed(page):
-        dump_debug(page, "start_dialog_stuck")
-        raise MeetBotError("❌ نافذة تأكيد التسجيل بقيت مفتوحة، لم يبدأ التسجيل")
+    if not confirmed:
+        print("   ℹ️ لم تظهر نافذة تأكيد (قد لا تكون مطلوبة)، سيتم التحقق من الحالة")
 
-    print(f"✅ [محاضرة {num}] بدأ التسجيل بنجاح!")
-    return "✅ بدأ التسجيل بنجاح في Google Meet!"
+    result = _verify_started(page)
+    if ALWAYS_DEBUG:
+        dump_debug(page, "after_start")
+
+    if result == "active":
+        print(f"✅ [محاضرة {num}] بدأ التسجيل بنجاح!")
+        return "✅ بدأ التسجيل بنجاح في Google Meet!"
+    if result == "idle":
+        raise MeetBotError("❌ تم الضغط لكن التسجيل لم يبدأ (زر Start recording ما زال ظاهراً)")
+    print(f"⚠️ [محاضرة {num}] لم أستطع التحقق من حالة التسجيل")
+    return "⚠️ تم الضغط على أزرار التسجيل لكن تعذر التأكد من البدء، تحقق يدوياً"
 
 
 @pw_thread
@@ -629,9 +668,16 @@ def stop_recording(num):
     if not confirmed:
         dump_debug(page, "no_stop_confirm")
         raise MeetBotError("❌ لم يظهر زر تأكيد إيقاف التسجيل")
-    if not _wait_dialog_closed(page):
-        dump_debug(page, "stop_dialog_stuck")
-        raise MeetBotError("❌ نافذة تأكيد الإيقاف بقيت مفتوحة، لم يتوقف التسجيل")
+    page.wait_for_timeout(2000)
+    result = _recording_state(page, reopen=True, timeout_ms=8000)
+    if ALWAYS_DEBUG:
+        dump_debug(page, "after_stop")
+
+    if result == "active":
+        raise MeetBotError("❌ تم الضغط لكن التسجيل ما زال يعمل (زر Stop recording ظاهر)")
+    if result == "unknown":
+        print(f"⚠️ [محاضرة {num}] لم أستطع التحقق من الإيقاف")
+        return "⚠️ تم الضغط على أزرار الإيقاف لكن تعذر التأكد، تحقق يدوياً"
 
     print(f"✅ [محاضرة {num}] تم إيقاف التسجيل")
     return "🛑 تم إيقاف التسجيل بنجاح!"
