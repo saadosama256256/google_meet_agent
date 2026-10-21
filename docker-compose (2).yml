@@ -1,0 +1,45 @@
+services:
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: browserless
+    restart: unless-stopped
+    shm_size: "2g"
+    environment:
+      - TOKEN=${BROWSERLESS_TOKEN:-ZH9MFsE5RgM2KYrz9ELSz5VIOSgYDqJE}
+      # إلغاء مهلة إغلاق الجلسة الإجباري (الافتراضي في Browserless هو 30000ms أي 30 ثانية فقط!)
+      - TIMEOUT=-1
+      - CONNECTION_TIMEOUT=-1
+      # تحديد مسار ثابت للبروفايل والكوكيز والـ IndexedDB داخل حاوية Browserless
+      - DATA_DIR=/data
+      - DEFAULT_USER_DATA_DIR=/data
+      - CONCURRENT=5
+      - QUEUED=5
+      - ENABLE_DEBUGGER=true
+    volumes:
+      - browserless_data:/data
+    ports:
+      - "3000:3000"
+
+  meet-bot:
+    build: .
+    container_name: meet-recording-bot
+    restart: unless-stopped
+    depends_on:
+      - browserless
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+      # الاتصال عبر الشبكة الداخلية لتجنب مهلة انقطاع WebSocket في Traefik / Cloudflare
+      - BROWSERLESS_WS=${BROWSERLESS_WS:-ws://browserless:3000?token=ZH9MFsE5RgM2KYrz9ELSz5VIOSgYDqJE}
+      - BOT_DATA_DIR=/app/data
+      - BROWSERLESS_PROFILE_DIR=/data/google_profile
+      - BROWSERLESS_TIMEOUT_MS=10800000
+      - KEEPALIVE_INTERVAL_SEC=15
+    volumes:
+      - bot_auth_data:/app/data
+    ports:
+      - "7860:7860"
+
+volumes:
+  browserless_data:
+  bot_auth_data:

@@ -1,0 +1,151 @@
+import logging
+import os
+import queue
+import threading
+import time
+import telebot
+import uvicorn
+from fastapi import FastAPI
+import browser
+from config import ALLOWED_USER_ID, KEEPALIVE_INTERVAL_SEC, TELEGRAM_TOKEN
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+cmd_queue = queue.Queue()
+
+
+def is_allowed(message):
+    return message.from_user.id == ALLOWED_USER_ID
+
+
+def run_browser_command(func, *args):
+    result = queue.Queue()
+    cmd_queue.put((func, args, result))
+    return result.get()
+
+
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(
+        message,
+        "👋 المساعد جاهز للاتصال بـ Browserless!\n"
+        "🔑 /login — لتسجيل الدخول وحفظ الجلسة الدائمة على السيرفر\n"
+        "🔴 /record — بدء تسجيل المحاضرة\n"
+        "🛑 /stop — إيقاف التسجيل ومغادرة الاجتماع\n"
+        "🔄 /rejoin — تحديث الصفحة وإعادة الانضمام",
+    )
+
+
+@bot.message_handler(commands=["login"])
+def cmd_login(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(
+        message,
+        "🌐 جاري فتح جلسة تسجيل الدخول المباشرة على السيرفر...\n"
+        "1️⃣ افتح لوحة **Browserless** ثم ادخل إلى **Sessions** واضغط **Inspect**.\n"
+        "2️⃣ أكمل تسجيل الدخول بحساب Google (البوت يرسل نبضات Keep-Alive تلقائياً كل 5 ثوانٍ لمنع انقطاع الجلسة).\n"
+        "3️⃣ بمجرد نجاح الدخول، سيقوم البوت برصد الكوكيز وحفظ الجلسة تلقائياً دون الحاجة لأي إجراء إضافي.",
+    )
+    result = run_browser_command(browser.manual_login)
+    bot.reply_to(message, result)
+
+
+@bot.message_handler(commands=["record"])
+def cmd_record(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(message, run_browser_command(browser.start_recording))
+
+
+@bot.message_handler(commands=["stop"])
+def cmd_stop(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(message, run_browser_command(browser.stop_recording))
+    bot.reply_to(message, run_browser_command(browser.leave_meeting))
+
+
+@bot.message_handler(commands=["rejoin"])
+def cmd_rejoin(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(message, run_browser_command(browser.refresh_and_rejoin))
+
+
+@bot.message_handler(func=lambda msg: msg.text and msg.text.startswith("https://meet.google.com/"))
+def cmd_join(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(message, "🔗 جاري الاتصال بالمتصفح والدخول للاجتماع...")
+
+    result = run_browser_command(browser.join_meeting, message.text.strip())
+
+    if "⚠️" in result or "فشل" in result:
+        if os.path.exists("error_screen.png"):
+            with open("error_screen.png", "rb") as photo:
+                bot.send_photo(message.chat.id, photo, caption="📸 لقطة شاشة للمشكلة الحالية:")
+            os.remove("error_screen.png")
+
+    if "✅" in result and os.path.exists("success_screen.png"):
+        with open("success_screen.png", "rb") as photo:
+            bot.send_photo(message.chat.id, photo, caption="📸 تم الدخول للاجتماع بنجاح:")
+        os.remove("success_screen.png")
+
+    bot.reply_to(message, result)
+
+
+def browser_loop():
+    """
+    حلقة معالجة أوامر المتصفح في Thread واحد متوافق مع Playwright Sync API،
+    مع إرسال نبضات Keep-Alive دورية كل 15 ثانية أثناء المحاضرات النشطة لمنع انقطاع WebSocket.
+    """
+    while True:
+        try:
+            func, args, result_queue = cmd_queue.get(timeout=KEEPALIVE_INTERVAL_SEC)
+        except queue.Empty:
+            # إرسال نبضة اتصال (CDP Heartbeat) إذا كانت هناك محاضرة جارية
+            try:
+                browser.keep_alive()
+            except Exception as e:
+                logging.warning(f"Keep-alive warning: {e}")
+            continue
+
+        try:
+            res = func(*args)
+            result_queue.put(res if res else "✅ تم الإجراء!")
+        except Exception as e:
+            logging.error(f"Browser command error: {e}")
+            result_queue.put(f"⚠️ حدث خطأ: {e}")
+
+
+def run_telebot():
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            logging.error(f"Telegram polling error: {e}")
+            time.sleep(5)
+
+
+app = FastAPI()
+
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "Running smoothly!",
+        "active_meetings": list(browser.state["pages"].keys()),
+        "browser_connected": bool(
+            browser.state["browser"] and browser.state["browser"].is_connected()
+        ),
+    }
+
+
+if __name__ == "__main__":
+    threading.Thread(target=browser_loop, daemon=True).start()
+    threading.Thread(target=run_telebot, daemon=True).start()
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="warning")
