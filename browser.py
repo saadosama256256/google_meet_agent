@@ -16,17 +16,13 @@ state = {
     "browser": None,
     "context": None,
     "pages": {},
+    "login_page": None,
     "login_in_progress": False,
 }
 
 
 def _build_stealth_script(full_version="131.0.6778.85", major_version="131"):
-    """
-    سكربت متقدم لإخفاء كافة دلائل الأتمتة و HeadlessChrome من:
-    1. Navigator.prototype.webdriver
-    2. navigator.userAgentData
-    3. window.chrome و WebGL Vendor/Renderer و Plugins
-    """
+    """سكربت إخفاء بصمة الأتمتة و HeadlessChrome داخل السياق الأساسي للمتصفح"""
     return f"""
 (() => {{
     try {{
@@ -108,8 +104,23 @@ def _build_ws_candidates():
     sep = "&" if "?" in base_url else "?"
     candidates = []
 
+    # الخيار 1: تمرير أعلام كروم مباشرة في الرابط (لإلغاء AutomationControlled بدون كسر المتصفح)
+    direct_flags = (
+        f"{base_url}{sep}timeout={BROWSERLESS_TIMEOUT_MS}"
+        "&stealth=true"
+        "&--disable-blink-features=AutomationControlled"
+        "&--no-sandbox"
+        "&--disable-dev-shm-usage"
+        "&--use-fake-ui-for-media-stream"
+        "&--use-fake-device-for-media-stream"
+        "&--window-size=1280,720"
+    )
+    candidates.append(direct_flags)
+
+    # الخيار 2: صيغة launch JSON مع ignoreDefaultArgs لإزالة --enable-automation
     launch_payload = {
         "stealth": True,
+        "ignoreDefaultArgs": ["--enable-automation"],
         "args": [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -121,13 +132,10 @@ def _build_ws_candidates():
         ],
     }
     encoded_launch = urllib.parse.quote(json.dumps(launch_payload))
-
     candidates.append(
         f"{base_url}{sep}timeout={BROWSERLESS_TIMEOUT_MS}&stealth=true&launch={encoded_launch}"
     )
-    candidates.append(
-        f"{base_url}{sep}timeout={BROWSERLESS_TIMEOUT_MS}&launch={encoded_launch}"
-    )
+
     if "timeout=" not in base_url:
         candidates.append(f"{base_url}{sep}timeout={BROWSERLESS_TIMEOUT_MS}")
     candidates.append(base_url)
@@ -142,23 +150,41 @@ def _get_existing_auth_file():
     return None
 
 
-def _close_blank_tabs(keep_page=None):
-    browser_obj = state.get("browser")
-    if not browser_obj:
-        return
+def _inject_cookies_into_context(context, auth_file):
+    """حقن الكوكيز داخل السياق الأساسي غير المعزول (contexts[0]) لضمان قراءتها"""
+    if not auth_file or not os.path.exists(auth_file):
+        return 0
     try:
-        for ctx in list(browser_obj.contexts):
-            for p in list(ctx.pages):
-                if keep_page is not None and p == keep_page:
-                    continue
-                try:
-                    url = p.url
-                    if not url or url == "about:blank" or url.startswith("chrome://"):
-                        p.close()
-                except Exception:
-                    pass
-    except Exception:
-        pass
+        with open(auth_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw_cookies = data.get("cookies", [])
+        if not raw_cookies:
+            return 0
+
+        allowed_keys = {
+            "name",
+            "value",
+            "domain",
+            "path",
+            "expires",
+            "httpOnly",
+            "secure",
+            "sameSite",
+        }
+        cleaned_cookies = []
+        for c in raw_cookies:
+            clean_c = {k: v for k, v in c.items() if k in allowed_keys and v is not None}
+            if "sameSite" in clean_c and clean_c["sameSite"] not in ("Strict", "Lax", "None"):
+                clean_c.pop("sameSite", None)
+            if "name" in clean_c and "value" in clean_c and "domain" in clean_c:
+                cleaned_cookies.append(clean_c)
+
+        context.add_cookies(cleaned_cookies)
+        print(f"🔑 تم حقن {len(cleaned_cookies)} كوكي بنجاح داخل السياق الأساسي (contexts[0])!")
+        return len(cleaned_cookies)
+    except Exception as e:
+        print(f"⚠️ خطأ أثناء حقن الكوكيز في السياق الأساسي: {e}")
+        return 0
 
 
 def is_google_logged_in(context=None):
@@ -225,41 +251,32 @@ def connect_browser():
                 full_ver = raw_version.split("/")[-1].strip()
                 major_ver = full_ver.split(".")[0] if "." in full_ver else "131"
 
-                matched_ua = (
-                    f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    f"(KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
-                )
-                client_hints_headers = {
-                    "sec-ch-ua": f'"Google Chrome";v="{major_ver}", "Chromium";v="{major_ver}", "Not_A Brand";v="24"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Linux"',
-                }
+                # ربط الاتصال بالسياق الأساسي للمتصفح لمنع فتح نوافذ Incognito معزولة
+                if browser_obj.contexts:
+                    context = browser_obj.contexts[0]
+                    print("📂 تم الربط مع السياق الأساسي للمتصفح (browser.contexts[0]).")
+                else:
+                    context = browser_obj.new_context(viewport={"width": 1280, "height": 720})
 
-                permissions = ["microphone", "camera", "notifications"]
-                auth_file = _get_existing_auth_file()
-
-                context_kwargs = {
-                    "permissions": permissions,
-                    "viewport": {"width": 1280, "height": 720},
-                    "user_agent": matched_ua,
-                    "extra_http_headers": client_hints_headers,
-                    "locale": "ar-EG",
-                    "timezone_id": "Africa/Cairo",
-                }
-
-                if auth_file:
-                    print(f"🔑 تم العثور على {auth_file} - جاري تحميل الجلسة المحفوظة...")
-                    context_kwargs["storage_state"] = auth_file
-
-                context = browser_obj.new_context(**context_kwargs)
+                try:
+                    context.grant_permissions(
+                        ["microphone", "camera", "notifications"],
+                        origin="https://meet.google.com",
+                    )
+                except Exception:
+                    pass
 
                 try:
                     context.add_init_script(_build_stealth_script(full_ver, major_ver))
                 except Exception:
                     pass
 
+                auth_file = _get_existing_auth_file()
+                if auth_file:
+                    _inject_cookies_into_context(context, auth_file)
+
                 state["context"] = context
-                print(f"✅ تم الاتصال بنجاح بـ Browserless (إصدار المتصفح المطابق: Chrome/{full_ver})!")
+                print(f"✅ تم الاتصال بنجاح بـ Browserless (Chrome/{full_ver})!")
                 return
             except Exception as e:
                 print(f"⚠️ تعذر الاتصال بالرابط المرشح: {e}")
@@ -274,6 +291,7 @@ def disconnect_browser(save_state=True):
         save_session_state()
 
     state["pages"].clear()
+    state["login_page"] = None
 
     if state.get("browser"):
         try:
@@ -302,10 +320,8 @@ def ensure_connection():
 
 
 def keep_alive():
-    """إرسال نبضة خفيفة على مستوى المتصفح لإبقاء WebSocket نشطاً وتنظيف التبويبات المغلقة"""
     if not state.get("browser") or not state["browser"].is_connected():
         return
-    # إزالة أي محاضرة أُغلق تبويبها
     for num, p in list(state["pages"].items()):
         try:
             if p.is_closed():
@@ -321,8 +337,31 @@ def keep_alive():
         print(f"⚠️ تنبيه Keep-Alive: {e}")
 
 
+def _acquire_page_in_default_context():
+    """إعادة استخدام التبويب المفتوح في المتصفح لمنع فتح صفحات بيضاء فارغة"""
+    context = state["context"]
+    used_pages = set(state["pages"].values())
+    if state.get("login_page") and not state["login_page"].is_closed():
+        used_pages.add(state["login_page"])
+
+    for p in list(context.pages):
+        try:
+            if not p.is_closed() and p not in used_pages:
+                if not p.url or p.url == "about:blank" or "workspace.google.com" in p.url:
+                    p.set_viewport_size({"width": 1280, "height": 720})
+                    return p
+        except Exception:
+            pass
+
+    page = context.new_page()
+    try:
+        page.set_viewport_size({"width": 1280, "height": 720})
+    except Exception:
+        pass
+    return page
+
+
 def get_next_lecture_num():
-    """تحديد رقم المحاضرة المتاح تلقائياً (1، 2، 3...) لفتح عدة محاضرات في نفس الوقت دون إغلاق السابقة"""
     i = 1
     while str(i) in state["pages"]:
         page = state["pages"][str(i)]
@@ -338,7 +377,6 @@ def get_next_lecture_num():
 
 
 def get_page(num=None):
-    """جلب تبويب المحاضرة المطلوبة (أو المحاضرة الوحيدة المفتوحة إذا لم يحدد الرقم)"""
     if num is not None:
         return state["pages"].get(str(num))
     if "1" in state["pages"]:
@@ -350,9 +388,17 @@ def get_page(num=None):
 
 
 def capture_screenshot(num=None):
-    """التقاط صورة فورية لشاشة المحاضرة لمتابعتها مباشرة عبر تليجرام"""
     ensure_connection()
-    target_num = str(num) if num else ("1" if "1" in state["pages"] else (sorted(state["pages"].keys())[0] if state["pages"] else "1"))
+    if state.get("login_in_progress") and state.get("login_page") and not state["login_page"].is_closed():
+        path = "screen_login.png"
+        state["login_page"].screenshot(path=path)
+        return path, "تسجيل الدخول", state["login_page"].url
+
+    target_num = (
+        str(num)
+        if num
+        else ("1" if "1" in state["pages"] else (sorted(state["pages"].keys())[0] if state["pages"] else "1"))
+    )
     page = state["pages"].get(target_num)
     if not page or page.is_closed():
         raise Exception(f"المحاضرة رقم {target_num} غير مفتوحة حالياً.")
@@ -363,10 +409,21 @@ def capture_screenshot(num=None):
 
 
 def get_active_meetings_summary():
-    """إرجاع ملخص بجميع المحاضرات المفتوحة حالياً"""
+    auth_file = _get_existing_auth_file()
+    if auth_file:
+        try:
+            with open(auth_file, "r", encoding="utf-8") as f:
+                c_count = len(json.load(f).get("cookies", []))
+            auth_status = f"🔑 **ملف الجلسة (`auth.json`):** موجود ✅ ({c_count} كوكي)"
+        except Exception:
+            auth_status = "🔑 **ملف الجلسة (`auth.json`):** موجود ✅"
+    else:
+        auth_status = "🔑 **ملف الجلسة (`auth.json`):** ❌ غير موجود"
+
     if not state["pages"]:
-        return "📭 لا توجد أي محاضرات مفتوحة حالياً."
-    lines = ["📊 **المحاضرات النشطة حالياً:**"]
+        return f"{auth_status}\n\n📭 لا توجد أي محاضرات مفتوحة حالياً."
+
+    lines = [auth_status, "", "📊 **المحاضرات النشطة حالياً:**"]
     for num, page in sorted(state["pages"].items()):
         try:
             status = "🟢 متصلة" if not page.is_closed() else "🔴 مغلقة"
@@ -376,94 +433,168 @@ def get_active_meetings_summary():
     return "\n".join(lines)
 
 
-def manual_login(on_ready_callback=None):
+# ==============================================================================
+# نظام الدخول التفاعلي عبر تليجرام (بدون فتح Inspect لتجنب كشف DevTools)
+# ==============================================================================
+
+def start_telegram_login():
     state["login_in_progress"] = True
-    page = None
-    try:
-        ensure_connection()
-        context = state["context"]
-        page = context.new_page()
+    ensure_connection()
+    page = _acquire_page_in_default_context()
+    state["login_page"] = page
 
-        _close_blank_tabs(keep_page=page)
+    print("🌐 فتح صفحة تسجيل دخول Google عبر تليجرام...")
+    page.goto(
+        "https://accounts.google.com/ServiceLogin?hl=ar&continue=https://meet.google.com/landing",
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+    page.wait_for_timeout(3000)
 
-        print("🌐 خطوة 1: تهيئة كوكيز التصفح الطبيعية على google.com...")
+    path = "login_step.png"
+    page.screenshot(path=path)
+
+    if is_google_logged_in(state["context"]) and "accounts.google.com" not in page.url:
+        save_session_state()
+        state["login_in_progress"] = False
+        return path, "✅ الحساب مسجل الدخول بالفعل على السيرفر وتم حفظ `auth.json`!"
+
+    caption = (
+        "🔐 **تم فتح بوابة الدخول على السيرفر بنجاح (وضع التخفي الكامل بدون Inspect)!**\n\n"
+        "1️⃣ **أرسل بريدك الإلكتروني الآن بهذا الأمر:**\n"
+        "`/email your_email@gmail.com`\n\n"
+        "*(ملاحظة: لا تفتح شاشة Inspect في Browserless حتى لا ترصد Google وجود أداة الفحص)*."
+    )
+    return path, caption
+
+
+def submit_login_email(email_text):
+    page = state.get("login_page")
+    if not page or page.is_closed():
+        raise Exception("⚠️ جلسة الدخول غير مفتوحة! أرسل `/login` أولاً.")
+
+    email_input = page.locator('input[type="email"], input[name="identifier"]').first
+    email_input.wait_for(timeout=15000)
+    email_input.click()
+    email_input.fill("")
+    email_input.type(email_text.strip(), delay=60)
+    page.wait_for_timeout(500)
+    page.keyboard.press("Enter")
+
+    page.wait_for_timeout(5000)
+    path = "login_step.png"
+    page.screenshot(path=path)
+
+    caption = (
+        "📧 **تم إرسال البريد الإلكتروني!**\n\n"
+        "2️⃣ إذا ظهرت خانة كلمة المرور في الصورة أعلاه، **أرسل كلمة المرور الآن بهذا الأمر:**\n"
+        "`/pass كلمة_المرور`"
+    )
+    return path, caption
+
+
+def submit_login_password(password_text):
+    page = state.get("login_page")
+    if not page or page.is_closed():
+        raise Exception("⚠️ جلسة الدخول غير مفتوحة! أرسل `/login` أولاً.")
+
+    pwd_input = page.locator('input[type="password"], input[name="Passwd"]').first
+    pwd_input.wait_for(timeout=15000)
+    pwd_input.click()
+    pwd_input.fill("")
+    pwd_input.type(password_text.strip(), delay=60)
+    page.wait_for_timeout(500)
+    page.keyboard.press("Enter")
+
+    page.wait_for_timeout(6000)
+    path = "login_step.png"
+    page.screenshot(path=path)
+
+    if is_google_logged_in(state["context"]) and "signin" not in page.url:
+        save_session_state()
+        state["login_in_progress"] = False
+        return (
+            path,
+            "🎉 **تم تسجيل الدخول وحفظ الجلسة (`auth.json`) من داخل السيرفر بنجاح!**\n"
+            "يمكنك الآن إرسال رابط أي محاضرة Google Meet مباشرة.",
+        )
+
+    caption = (
+        "🔑 **تم إرسال كلمة المرور!** انظر للصورة أعلاه:\n\n"
+        "• إذا طلب Google **الموافقة أو اختيار رقم على هاتفك**، وافق من هاتفك ثم أرسل:\n"
+        "`/save`\n"
+        "• وإذا طلب **كود تحقق نصي**، أرسله بهذا الأمر:\n"
+        "`/code 123456`"
+    )
+    return path, caption
+
+
+def submit_login_code(code_text):
+    page = state.get("login_page")
+    if not page or page.is_closed():
+        raise Exception("⚠️ جلسة الدخول غير مفتوحة! أرسل `/login` أولاً.")
+
+    code_input = page.locator(
+        'input[type="tel"], input[name="totpPin"], input[name="idvPin"], input[name="Pin"], input[type="text"]'
+    ).first
+    code_input.wait_for(timeout=15000)
+    code_input.click()
+    code_input.fill("")
+    code_input.type(code_text.strip(), delay=60)
+    page.wait_for_timeout(500)
+    page.keyboard.press("Enter")
+
+    page.wait_for_timeout(6000)
+    return finish_and_save_login()
+
+
+def finish_and_save_login():
+    page = state.get("login_page")
+    if not page or page.is_closed():
+        raise Exception("⚠️ جلسة الدخول غير مفتوحة! أرسل `/login` أولاً.")
+
+    page.wait_for_timeout(3000)
+    if is_google_logged_in(state["context"]):
         try:
-            page.goto("https://www.google.com/?hl=ar", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(1.5)
+            if "meet.google.com" not in page.url:
+                page.goto("https://meet.google.com/landing", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
         except Exception:
             pass
 
-        print("🌐 خطوة 2: جاري فتح صفحة تسجيل الدخول لحساب Google...")
-        page.goto(
-            "https://accounts.google.com/ServiceLogin?hl=ar&passive=true&continue=https://www.google.com/",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        time.sleep(2)
-
-        _close_blank_tabs(keep_page=page)
-
-        preview_path = "login_ready.png"
-        try:
-            page.screenshot(path=preview_path)
-        except Exception:
-            preview_path = None
-
-        if on_ready_callback:
-            try:
-                on_ready_callback(preview_path, page.url)
-            except Exception as cb_err:
-                print(f"⚠️ خطأ أثناء إرسال إشعار الجاهزية: {cb_err}")
-
-        print("⏰ الشاشة جاهزة. قم بتسجيل الدخول الآن من قائمة Sessions > Inspect...")
-
-        iterations = max(12, LOGIN_WAIT_TIMEOUT_SEC // 5)
-        login_detected = False
-        for i in range(iterations):
-            time.sleep(5)
-            try:
-                if is_google_logged_in(context):
-                    print("🎉 تم رصد كوكيز تسجيل الدخول بنجاح! جاري الانتظار 5 ثوانٍ لاستقرار التوجيه...")
-                    time.sleep(5)
-                    save_session_state()
-                    login_detected = True
-                    break
-            except Exception as loop_err:
-                print(f"ℹ️ انتظار استكمال الدخول... ({loop_err})")
-
         save_session_state()
-
-        if login_detected or is_google_logged_in(context):
-            try:
-                page.close()
-            except Exception:
-                pass
-            if not state["pages"]:
-                disconnect_browser(save_state=False)
-            return (
-                "✅ تم تسجيل الدخول وحفظ الجلسة (auth.json) داخل السيرفر بنجاح!\n"
-                "يمكنك الآن إرسال روابط محاضرات Google Meet مباشرة."
-            )
-        else:
-            try:
-                page.close()
-            except Exception:
-                pass
-            if not state["pages"]:
-                disconnect_browser(save_state=False)
-            minutes = LOGIN_WAIT_TIMEOUT_SEC // 60
-            return (
-                f"⚠️ انتهت المهلة ({minutes} دقائق) دون رصد اكتمال تسجيل الدخول.\n"
-                "أرسل /login في أي وقت للمحاولة مرة أخرى."
-            )
-    finally:
+        path = "login_step.png"
+        page.screenshot(path=path)
         state["login_in_progress"] = False
+        return (
+            path,
+            "🎉 **تم توثيق الحساب على السيرفر وحفظ الجلسة (`auth.json`) بنجاح 100%!**\n"
+            "الجلسة الآن مربوطة بـ IP السيرفر نفسه ولن تنتهي صلاحيتها. أرسل رابط Google Meet للتجربة!",
+        )
+    else:
+        path = "login_step.png"
+        page.screenshot(path=path)
+        return (
+            path,
+            "⏳ لم يرصد المتصفح اكتمال الكوكيز بعد. إذا وافقت من هاتفك للتو، انتظر 5 ثوانٍ وأرسل `/save` مرة أخرى.",
+        )
 
 
 def join_meeting(link, num=None):
+    auth_file = _get_existing_auth_file()
+    if not auth_file and not is_google_logged_in():
+        raise Exception(
+            "⚠️ ملف الجلسة `auth.json` غير موجود على السيرفر!\n"
+            "أرسل `/login` لتسجيل الدخول مباشرة من تليجرام، أو أرسل ملف `auth.json` في المحادثة."
+        )
+
     ensure_connection()
-    num = str(num) if num else get_next_lecture_num()
     context = state["context"]
+
+    if not is_google_logged_in(context) and auth_file:
+        _inject_cookies_into_context(context, auth_file)
+
+    num = str(num) if num else get_next_lecture_num()
 
     if num in state["pages"]:
         try:
@@ -471,63 +602,83 @@ def join_meeting(link, num=None):
         except Exception:
             pass
 
-    page = context.new_page()
-    _close_blank_tabs(keep_page=page)
+    page = _acquire_page_in_default_context()
     state["pages"][num] = page
 
-    print(f"🔗 [محاضرة {num}] جاري الدخول: {link}")
-    page.goto(link, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(4000)
-
-    current_url = page.url
-    if "accounts.google.com" in current_url:
-        try:
-            page.screenshot(path="error_screen.png")
-        except Exception:
-            pass
-        try:
-            page.close()
-        except Exception:
-            pass
-        state["pages"].pop(num, None)
-        raise Exception("⚠️ الحساب يطلب تسجيل الدخول! أرسل ملف auth.json أو أمر /login لتوثيق الجلسة أولاً.")
-
-    dismiss_selectors = [
-        "button:has-text('Dismiss')",
-        "button:has-text('تجاهل')",
-        "button:has-text('Continue without microphone and camera')",
-        "button:has-text('المتابعة بدون ميكروفون وكاميرا')",
-        "button:has-text('Got it')",
-        "button:has-text('حسناً')",
-    ]
-    for sel in dismiss_selectors:
-        try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=1000):
-                btn.click()
-                page.wait_for_timeout(500)
-        except Exception:
-            pass
-
     try:
-        page.keyboard.down("Control")
-        page.keyboard.press("d")
-        page.keyboard.press("e")
-        page.keyboard.up("Control")
-    except Exception:
-        pass
+        print(f"🔗 [محاضرة {num}] جاري الدخول: {link}")
+        page.goto(link, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)
 
-    join_selector = (
-        "button:has-text('Join now'), "
-        "button:has-text('Ask to join'), "
-        "button:has-text('الانضمام الآن'), "
-        "button:has-text('طلب الانضمام'), "
-        "button:has-text('Join now without microphone'), "
-        "button:has-text('Switch here'), "
-        "button:has-text('الانضمام من هنا')"
-    )
+        blocked_locator = page.locator(
+            "text=/لا يُمكنك الانضمام|لا يمكنك الانضمام|You can't join this video call/i"
+        )
+        if (
+            "accounts.google.com" in page.url
+            or "workspace.google.com" in page.url
+            or (blocked_locator.count() > 0 and blocked_locator.first.is_visible())
+        ):
+            encoded_continue = urllib.parse.quote(link, safe="")
+            sync_url = f"https://accounts.google.com/ServiceLogin?passive=true&continue={encoded_continue}"
+            page.goto(sync_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(4000)
 
-    try:
+        current_url = page.url
+        if "accounts.google.com" in current_url or "workspace.google.com" in current_url:
+            try:
+                page.screenshot(path="error_screen.png")
+            except Exception:
+                pass
+            raise Exception(
+                "⚠️ رفض Google الكوكيز المنقولة من جهازك الشخصي بسبب اختلاف الـ IP!\n"
+                "💡 **الحل الجذري:** أرسل الآن أمر `/login` وسجّل دخولك مباشرة من تليجرام عبر `/email` و `/pass` لتُنشأ الجلسة من IP السيرفر نفسه!"
+            )
+
+        if blocked_locator.count() > 0 and blocked_locator.first.is_visible():
+            try:
+                page.screenshot(path="error_screen.png")
+            except Exception:
+                pass
+            raise Exception(
+                "⚠️ ألغى Google صلاحية الكوكيز الخارجية بسبب تغير الـ IP من مصر إلى السيرفر!\n"
+                "💡 **الحل الجذري:** أرسل أمر `/login` الآن وسجّل دخولك مباشرة من تليجرام عبر `/email` و `/pass` لتُحفظ الجلسة بـ IP السيرفر نفسه."
+            )
+
+        dismiss_selectors = [
+            "button:has-text('Dismiss')",
+            "button:has-text('تجاهل')",
+            "button:has-text('Continue without microphone and camera')",
+            "button:has-text('المتابعة بدون ميكروفون وكاميرا')",
+            "button:has-text('Got it')",
+            "button:has-text('حسناً')",
+        ]
+        for sel in dismiss_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+        try:
+            page.keyboard.down("Control")
+            page.keyboard.press("d")
+            page.keyboard.press("e")
+            page.keyboard.up("Control")
+        except Exception:
+            pass
+
+        join_selector = (
+            "button:has-text('Join now'), "
+            "button:has-text('Ask to join'), "
+            "button:has-text('الانضمام الآن'), "
+            "button:has-text('طلب الانضمام'), "
+            "button:has-text('Join now without microphone'), "
+            "button:has-text('Switch here'), "
+            "button:has-text('الانضمام من هنا')"
+        )
+
         join_button = page.locator(join_selector).first
         join_button.wait_for(timeout=25000)
         join_button.click()
@@ -543,12 +694,14 @@ def join_meeting(link, num=None):
             f"📸 لمتابعة الشاشة: `/screen {num}`\n"
             f"🛑 للإيقاف والمغادرة: `/stop {num}`"
         )
-    except Exception:
+    except Exception as e:
         try:
-            page.screenshot(path="error_screen.png")
+            if not os.path.exists("error_screen.png"):
+                page.screenshot(path="error_screen.png")
         except Exception:
             pass
-        raise Exception(f"[محاضرة {num}] لم يتم العثور على زر الانضمام. (عنوان الصفحة: {page.title()})")
+        state["pages"].pop(num, None)
+        raise Exception(str(e))
 
 
 def start_recording(num="1"):
