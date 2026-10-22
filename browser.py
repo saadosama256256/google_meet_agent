@@ -22,7 +22,6 @@ state = {
 
 
 def _build_stealth_script(full_version="131.0.6778.85", major_version="131"):
-    """سكربت إخفاء بصمة الأتمتة و HeadlessChrome داخل السياق الأساسي للمتصفح"""
     return f"""
 (() => {{
     try {{
@@ -86,15 +85,6 @@ def _build_stealth_script(full_version="131.0.6778.85", major_version="131"):
             configurable: true
         }});
     }} catch (e) {{}}
-
-    try {{
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-            if (parameter === 37445) return 'Intel Inc.';
-            if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-            return getParameter.apply(this, arguments);
-        }};
-    }} catch (e) {{}}
 }})();
 """
 
@@ -104,7 +94,6 @@ def _build_ws_candidates():
     sep = "&" if "?" in base_url else "?"
     candidates = []
 
-    # الخيار 1: تمرير أعلام كروم مباشرة في الرابط (لإلغاء AutomationControlled بدون كسر المتصفح)
     direct_flags = (
         f"{base_url}{sep}timeout={BROWSERLESS_TIMEOUT_MS}"
         "&stealth=true"
@@ -117,7 +106,6 @@ def _build_ws_candidates():
     )
     candidates.append(direct_flags)
 
-    # الخيار 2: صيغة launch JSON مع ignoreDefaultArgs لإزالة --enable-automation
     launch_payload = {
         "stealth": True,
         "ignoreDefaultArgs": ["--enable-automation"],
@@ -151,7 +139,6 @@ def _get_existing_auth_file():
 
 
 def _inject_cookies_into_context(context, auth_file):
-    """حقن الكوكيز داخل السياق الأساسي غير المعزول (contexts[0]) لضمان قراءتها"""
     if not auth_file or not os.path.exists(auth_file):
         return 0
     try:
@@ -251,7 +238,6 @@ def connect_browser():
                 full_ver = raw_version.split("/")[-1].strip()
                 major_ver = full_ver.split(".")[0] if "." in full_ver else "131"
 
-                # ربط الاتصال بالسياق الأساسي للمتصفح لمنع فتح نوافذ Incognito معزولة
                 if browser_obj.contexts:
                     context = browser_obj.contexts[0]
                     print("📂 تم الربط مع السياق الأساسي للمتصفح (browser.contexts[0]).")
@@ -338,7 +324,6 @@ def keep_alive():
 
 
 def _acquire_page_in_default_context():
-    """إعادة استخدام التبويب المفتوح في المتصفح لمنع فتح صفحات بيضاء فارغة"""
     context = state["context"]
     used_pages = set(state["pages"].values())
     if state.get("login_page") and not state["login_page"].is_closed():
@@ -434,7 +419,7 @@ def get_active_meetings_summary():
 
 
 # ==============================================================================
-# نظام الدخول التفاعلي عبر تليجرام (بدون فتح Inspect لتجنب كشف DevTools)
+# نظام الدخول التفاعلي عبر تليجرام
 # ==============================================================================
 
 def start_telegram_login():
@@ -610,38 +595,19 @@ def join_meeting(link, num=None):
         page.goto(link, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(4000)
 
+        # فحص مباشر لما إذا كانت قاعة الاجتماع مقيدة أو مغلقة من قبل المضيف
         blocked_locator = page.locator(
             "text=/لا يُمكنك الانضمام|لا يمكنك الانضمام|You can't join this video call/i"
         )
-        if (
-            "accounts.google.com" in page.url
-            or "workspace.google.com" in page.url
-            or (blocked_locator.count() > 0 and blocked_locator.first.is_visible())
-        ):
-            encoded_continue = urllib.parse.quote(link, safe="")
-            sync_url = f"https://accounts.google.com/ServiceLogin?passive=true&continue={encoded_continue}"
-            page.goto(sync_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4000)
-
-        current_url = page.url
-        if "accounts.google.com" in current_url or "workspace.google.com" in current_url:
-            try:
-                page.screenshot(path="error_screen.png")
-            except Exception:
-                pass
-            raise Exception(
-                "⚠️ رفض Google الكوكيز المنقولة من جهازك الشخصي بسبب اختلاف الـ IP!\n"
-                "💡 **الحل الجذري:** أرسل الآن أمر `/login` وسجّل دخولك مباشرة من تليجرام عبر `/email` و `/pass` لتُنشأ الجلسة من IP السيرفر نفسه!"
-            )
-
         if blocked_locator.count() > 0 and blocked_locator.first.is_visible():
             try:
                 page.screenshot(path="error_screen.png")
             except Exception:
                 pass
             raise Exception(
-                "⚠️ ألغى Google صلاحية الكوكيز الخارجية بسبب تغير الـ IP من مصر إلى السيرفر!\n"
-                "💡 **الحل الجذري:** أرسل أمر `/login` الآن وسجّل دخولك مباشرة من تليجرام عبر `/email` و `/pass` لتُحفظ الجلسة بـ IP السيرفر نفسه."
+                "🔒 **الاجتماع مقيّد أو لم يبدأه المضيف بعد!**\n"
+                "(Your meeting is safe: لا يُسمح بالانضمام إلا بدعوة من المضيف أو قبول الدخول يدويًا).\n"
+                "👉 **جرب الآن إرسال رابط اجتماع مفتوح أو فوري من هاتفك للتأكد من نجاح الدخول الفوري.**"
             )
 
         dismiss_selectors = [
@@ -669,7 +635,9 @@ def join_meeting(link, num=None):
         except Exception:
             pass
 
+        # البحث بالمعرّف الداخلي الرسمي button[jsname='Qx7uuf'] أولاً ثم بالنصوص
         join_selector = (
+            "button[jsname='Qx7uuf'], "
             "button:has-text('Join now'), "
             "button:has-text('Ask to join'), "
             "button:has-text('الانضمام الآن'), "
@@ -805,6 +773,7 @@ def refresh_and_rejoin(num="1"):
 
     page.reload(wait_until="domcontentloaded", timeout=60000)
     join_button = page.locator(
+        "button[jsname='Qx7uuf'], "
         "button:has-text('Join now'), "
         "button:has-text('Join now without microphone'), "
         "button:has-text('الانضمام الآن')"
