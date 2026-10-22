@@ -13,7 +13,6 @@ from config import (
     ALLOWED_USER_ID,
     AUTH_STATE_PATH,
     KEEPALIVE_INTERVAL_SEC,
-    LOGIN_WAIT_TIMEOUT_SEC,
     TELEGRAM_TOKEN,
 )
 
@@ -33,12 +32,30 @@ def run_browser_command(func, *args):
     return result.get()
 
 
+def _extract_arg(message_text, default=""):
+    parts = (message_text or "").strip().split(maxsplit=1)
+    return parts[1].strip() if len(parts) >= 2 else default
+
+
 def _extract_lecture_num(message_text, default="1"):
-    """استخراج رقم المحاضرة من الأمر (مثلاً: '/record 2' -> '2'، أو '/record' -> '1')"""
     parts = (message_text or "").strip().split()
     if len(parts) >= 2 and parts[1].isdigit():
         return parts[1]
     return default
+
+
+def _send_step_result(chat_id, res):
+    """إرسال نتيجة خطوات الدخول (صورة + نص) للمستخدم في تليجرام"""
+    if isinstance(res, tuple) and len(res) == 2:
+        path, caption = res
+        if path and os.path.exists(path):
+            with open(path, "rb") as photo:
+                bot.send_photo(chat_id, photo, caption=caption)
+            os.remove(path)
+            return
+        bot.send_message(chat_id, caption)
+    else:
+        bot.send_message(chat_id, str(res))
 
 
 @bot.message_handler(commands=["start", "help"])
@@ -48,16 +65,18 @@ def cmd_start(message):
     bot.reply_to(
         message,
         "👋 **المساعد جاهز ومتصل بـ Browserless!**\n\n"
-        "📌 **الأوامر المتاحة (تدعم المحاضرات المتعددة):**\n"
-        "• أرسل رابط `https://meet.google.com/...` مباشرة للانضمام (يفتح كل رابط في تبويب مستقل برقم تلقائي 1، 2، 3...).\n"
-        "• `/status` — عرض قائمة المحاضرات المفتوحة حالياً وأرقامها\n"
-        "• `/screen` أو `/screen 2` — إرسال لقطة شاشة حية لمتابعة المحاضرة\n"
-        "• `/record` أو `/record 2` — بدء تسجيل المحاضرة\n"
-        "• `/stop` أو `/stop 2` — إيقاف التسجيل ومغادرة المحاضرة\n"
-        "• `/leave` أو `/leave 2` — مغادرة المحاضرة بدون إيقاف التسجيل\n"
-        "• `/rejoin` أو `/rejoin 2` — تحديث الصفحة وإعادة الانضمام\n"
-        "• `/login` — فتح جلسة تسجيل دخول يدوية\n"
-        "• 📎 أو أرسل ملف `auth.json` مباشرة في المحادثة لتحديث الجلسة.",
+        "🔐 **أوامر تسجيل الدخول المباشر من تليجرام (بدون فتح Inspect):**\n"
+        "1. `/login` — فتح صفحة دخول Google على السيرفر\n"
+        "2. `/email your@gmail.com` — إدخال البريد الإلكتروني\n"
+        "3. `/pass your_password` — إدخال كلمة المرور\n"
+        "4. `/code 123456` — إدخال كود التحقق النصي (إن طُلب)\n"
+        "5. `/save` — حفظ الجلسة بعد الموافقة من الهاتف\n\n"
+        "📹 **أوامر المحاضرات (تدعم المحاضرات المتعددة):**\n"
+        "• أرسل رابط `https://meet.google.com/...` للانضمام\n"
+        "• `/status` — عرض حالة الكوكيز والمحاضرات المفتوحة\n"
+        "• `/screen` أو `/screen 2` — لقطة شاشة حية للمحاضرة\n"
+        "• `/record` أو `/record 2` — بدء التسجيل\n"
+        "• `/stop` أو `/stop 2` — إيقاف التسجيل والمغادرة",
     )
 
 
@@ -74,14 +93,14 @@ def cmd_screen(message):
         return
     num = _extract_lecture_num(message.text, default=None)
     res = run_browser_command(browser.capture_screenshot, num)
-    if isinstance(res, tuple):
+    if isinstance(res, tuple) and len(res) == 3:
         path, target_num, url = res
         if os.path.exists(path):
             with open(path, "rb") as photo:
                 bot.send_photo(
                     message.chat.id,
                     photo,
-                    caption=f"📸 لقطة شاشة حية — **محاضرة {target_num}**\n🔗 {url}",
+                    caption=f"📸 لقطة شاشة حية — **{target_num}**\n🔗 {url}",
                 )
             os.remove(path)
             return
@@ -92,37 +111,62 @@ def cmd_screen(message):
 def cmd_login(message):
     if not is_allowed(message):
         return
-    minutes = LOGIN_WAIT_TIMEOUT_SEC // 60
-    bot.reply_to(
-        message,
-        "⏳ جاري الاتصال بـ Browserless وتفعيل وضع التخفي (Stealth) وفتح صفحة دخول Google...\n"
-        "انتظر ثواني حتى تصلك صورة الصفحة هنا قبل الضغط على Inspect.",
-    )
+    bot.reply_to(message, "⏳ جاري فتح صفحة تسجيل دخول Google على السيرفر...")
+    res = run_browser_command(browser.start_telegram_login)
+    _send_step_result(message.chat.id, res)
 
-    def notify_page_ready(preview_path, current_url):
-        caption = (
-            f"🟢 **صفحة تسجيل الدخول جاهزة الآن (المهلة: {minutes} دقائق)!**\n"
-            "1️⃣ افتح لوحة **Browserless > Sessions** واضغط على الجلسة (**Inspect**).\n"
-            "2️⃣ أدخل البريد الإلكتروني وكلمة المرور وكود التحقق.\n"
-            "3️⃣ لا تغلق المتصفح؛ البوت سيرصد نجاح الدخول ويحفظ الجلسة تلقائياً."
-        )
-        if preview_path and os.path.exists(preview_path):
-            try:
-                with open(preview_path, "rb") as photo:
-                    bot.send_photo(message.chat.id, photo, caption=caption)
-                os.remove(preview_path)
-                return
-            except Exception:
-                pass
-        bot.send_message(message.chat.id, caption)
 
-    result = run_browser_command(browser.manual_login, notify_page_ready)
-    bot.reply_to(message, result)
+@bot.message_handler(commands=["email"])
+def cmd_email(message):
+    if not is_allowed(message):
+        return
+    email_text = _extract_arg(message.text)
+    if not email_text:
+        bot.reply_to(message, "⚠️ اكتب البريد بعد الأمر هكذا:\n`/email your_email@gmail.com`")
+        return
+    bot.reply_to(message, "⏳ جاري كتابة البريد الإلكتروني والضغط على التالي...")
+    res = run_browser_command(browser.submit_login_email, email_text)
+    _send_step_result(message.chat.id, res)
+
+
+@bot.message_handler(commands=["pass"])
+def cmd_pass(message):
+    if not is_allowed(message):
+        return
+    pwd_text = _extract_arg(message.text)
+    if not pwd_text:
+        bot.reply_to(message, "⚠️ اكتب كلمة المرور بعد الأمر هكذا:\n`/pass كلمة_المرور`")
+        return
+    bot.reply_to(message, "⏳ جاري كتابة كلمة المرور والضغط على التالي...")
+    res = run_browser_command(browser.submit_login_password, pwd_text)
+    _send_step_result(message.chat.id, res)
+
+
+@bot.message_handler(commands=["code"])
+def cmd_code(message):
+    if not is_allowed(message):
+        return
+    code_text = _extract_arg(message.text)
+    if not code_text:
+        bot.reply_to(message, "⚠️ اكتب الكود بعد الأمر هكذا:\n`/code 123456`")
+        return
+    bot.reply_to(message, "⏳ جاري إدخال كود التحقق...")
+    res = run_browser_command(browser.submit_login_code, code_text)
+    _send_step_result(message.chat.id, res)
+
+
+@bot.message_handler(commands=["save"])
+def cmd_save(message):
+    if not is_allowed(message):
+        return
+    bot.reply_to(message, "⏳ جاري فحص الكوكيز وحفظ الجلسة...")
+    res = run_browser_command(browser.finish_and_save_login)
+    _send_step_result(message.chat.id, res)
 
 
 @bot.message_handler(content_types=["document"])
 def handle_auth_file_upload(message):
-    """استقبال ملف auth.json مباشرة عبر تليجرام وحفظه في المسار الدائم"""
+    """استقبال ملف auth.json مباشرة عبر تليجرام وحقنه في السياق الأساسي"""
     if not is_allowed(message):
         return
     doc = message.document
@@ -134,7 +178,7 @@ def handle_auth_file_upload(message):
         downloaded = bot.download_file(file_info.file_path)
         parsed = json.loads(downloaded.decode("utf-8"))
         if "cookies" not in parsed:
-            bot.reply_to(message, "⚠️ الملف المرفوع لا يحتوي على حقل `cookies` صالح لـ Playwright.")
+            bot.reply_to(message, "⚠️ الملف المرفوع لا يحتوي على حقل `cookies` صالح.")
             return
 
         with open(AUTH_STATE_PATH, "wb") as f:
@@ -146,7 +190,7 @@ def handle_auth_file_upload(message):
         bot.reply_to(
             message,
             f"✅ تم استيراد وحفظ ملف الجلسة ({len(parsed['cookies'])} كوكي) بنجاح في `{AUTH_STATE_PATH}`!\n"
-            "جرب الآن إرسال رابط اجتماع Google Meet.",
+            "سيتم حقنها مباشرة في السياق الأساسي (`contexts[0]`). جرب الآن إرسال رابط اجتماع Google Meet.",
         )
     except Exception as e:
         bot.reply_to(message, f"⚠️ فشل استيراد ملف الجلسة: {e}")
@@ -201,7 +245,7 @@ def cmd_join(message):
     if not link:
         return
 
-    bot.reply_to(message, "🔗 جاري فتح تبويب جديد والدخول للاجتماع...")
+    bot.reply_to(message, "🔗 جاري الدخول للاجتماع عبر السياق الأساسي...")
 
     result = run_browser_command(browser.join_meeting, link, num)
 
@@ -220,10 +264,6 @@ def cmd_join(message):
 
 
 def browser_loop():
-    """
-    حلقة معالجة أوامر المتصفح في Thread واحد،
-    مع إرسال نبضات Keep-Alive دورية كل 15 ثانية أثناء المحاضرات النشطة لمنع انقطاع WebSocket.
-    """
     while True:
         try:
             func, args, result_queue = cmd_queue.get(timeout=KEEPALIVE_INTERVAL_SEC)
